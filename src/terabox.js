@@ -4,8 +4,15 @@ const path = require('path');
 const { getReadableFileSize } = require('./utils');
 const { loginAndGetCookies } = require('./auth');
 
+// Cache for storing login cookies to avoid repeated logins
+const cookieCache = {
+  cookies: null,
+  timestamp: 0,
+  expiresIn: 3600000 // 1 hour in milliseconds
+};
+
 /**
- * Get links from Terabox URL
+ * Get links from Terabox URL with timeout optimization
  * @param {string} url - Terabox share URL
  * @param {string} email - Terabox email
  * @param {string} password - Terabox password
@@ -13,11 +20,21 @@ const { loginAndGetCookies } = require('./auth');
  */
 async function getLinks(url, email, password) {
   try {
-    // Create session with cookies
-    const cookies = await loginAndGetCookies(email, password);
+    // Set shorter timeouts for all requests
+    const axiosConfig = {
+      timeout: 8000, // 8 seconds timeout (Vercel has 10s limit on hobby plan)
+      maxRedirects: 5,
+      validateStatus: status => status >= 200 && status < 500
+    };
+    
+    // Use cached cookies if available and not expired
+    if (!cookieCache.cookies || Date.now() - cookieCache.timestamp > cookieCache.expiresIn) {
+      cookieCache.cookies = await loginAndGetCookies(email, password);
+      cookieCache.timestamp = Date.now();
+    }
     
     // Convert cookie object to Cookie header string
-    const cookieString = Object.entries(cookies)
+    const cookieString = Object.entries(cookieCache.cookies)
       .map(([key, value]) => `${key}=${value}`)
       .join('; ');
     
@@ -29,8 +46,7 @@ async function getLinks(url, email, password) {
     // First request to get jsToken
     const initialResponse = await axios.get(url, { 
       headers,
-      maxRedirects: 5,
-      validateStatus: status => status >= 200 && status < 500
+      ...axiosConfig
     });
     
     // Extract jsToken using regex
@@ -68,7 +84,7 @@ async function getLinks(url, email, password) {
     const listResponse = await axios.get('https://www.1024tera.com/share/list', {
       headers,
       params,
-      timeout: 30000 // 30s timeout for large folders
+      ...axiosConfig
     });
     
     const data = listResponse.data;
@@ -79,40 +95,36 @@ async function getLinks(url, email, password) {
       };
     }
     
+    // Return top-level files only to avoid timeouts
+    // Don't recursively fetch directory contents
     let totalSize = 0;
     const files = [];
     
-    // Recursive function to fetch all files
-    async function fetchFiles(contents, folder = '') {
-      for (const item of contents) {
-        if (item.isdir === 1) {
-          // Handle directory
-          const fetchSubParams = { ...params, dir: item.path };
-          const fetchSubResponse = await axios.get('https://www.1024tera.com/share/list', {
-            headers,
-            params: fetchSubParams
-          });
-          
-          await fetchFiles(
-            fetchSubResponse.data.list || [], 
-            path.join(folder, item.server_filename)
-          );
-        } else {
-          // Handle file
-          const size = item.size || 0;
-          totalSize += size;
-          
-          files.push({
-            filename: item.server_filename,
-            path: folder,
-            size: getReadableFileSize(size),
-            url: item.dlink
-          });
-        }
+    for (const item of data.list || []) {
+      if (item.isdir === 0) {
+        // Only process files, skip directories
+        const size = item.size || 0;
+        totalSize += size;
+        
+        files.push({
+          filename: item.server_filename,
+          path: '',
+          size: getReadableFileSize(size),
+          url: item.dlink,
+          isdir: false
+        });
+      } else {
+        // Just note that there's a directory but don't fetch its contents
+        files.push({
+          filename: item.server_filename,
+          path: '',
+          size: 'Directory',
+          url: null,
+          isdir: true,
+          dir_path: item.path
+        });
       }
     }
-    
-    await fetchFiles(data.list || []);
     
     return {
       status: 'success',
